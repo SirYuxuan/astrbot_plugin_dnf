@@ -1,8 +1,43 @@
-# helloworld
+# yuxuandnf
 
-AstrBot 插件模板
+雨轩 DNF 查询插件
 
-A template plugin for AstrBot plugin feature
+本插件基于 AstrBot 插件系统开发，支持自动抓取并查询地下城与勇士（DNF）金币比例，数据来源于 DD373。
+
+## 功能简介
+
+- 查询 DNF 金币比例，自动抓取 DD373 最新数据
+- QQ/手机端友好格式输出
+- 支持自定义指令
+
+## 使用方法
+
+1. 安装依赖
+   ```bash
+   pip install -r requirements.txt
+   ```
+2. 按照 AstrBot 插件开发文档，将本插件放入插件目录
+3. 在群聊或私聊中发送 `/金币比例` 指令，即可获取最新金币比例
+
+## 依赖
+
+- astrbot
+- requests
+- beautifulsoup4
+
+## 示例输出
+
+```
+【DNF金币比例前5】
+1. 1200万金币=22.50元
+   1元=53.3333万金币
+2. 4000万金币=76.00元
+   1元=52.6316万金币
+...
+——
+均价：1元=52.7416万金币
+数据来源：DD373
+```
 
 # 支持
 
