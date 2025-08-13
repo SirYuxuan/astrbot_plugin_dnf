@@ -6,9 +6,10 @@ import asyncio
 import re
 import os
 import json
+import requests
 from astrbot.api.event import MessageChain
 
-@register("yuxuandnf", "Sir 丶雨轩", "雨轩DNF 查询插件。", "v1.0")
+@register("yuxuandnf", "Sir 丶雨轩", "雨轩DNF 查询插件，支持金币比例查询和油价查询。", "v1.1")
 class DNF_Plugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
@@ -113,6 +114,66 @@ class DNF_Plugin(Star):
         user_name = event.get_sender_name()
         ratio_text = DnfGoldRatioFetcher.fetch_gold_ratio_text()
         yield event.plain_result(ratio_text)
+
+    @filter.command("油价")
+    async def oil_price(self, event):
+        """查询油价信息"""
+        try:
+            # 获取消息内容，提取地区信息
+            message = event.get_message_content()
+            # 提取地区名称，格式：油价 河南
+            area_match = re.search(r'油价\s+(.+)', message)
+            if not area_match:
+                yield event.plain_result("请使用格式：油价 地区名\n例如：油价 河南")
+                return
+            
+            area = area_match.group(1).strip()
+            
+            # 构建API请求URL
+            api_url = "https://www.iamwawa.cn/oilprice/api"
+            params = {"area": area}
+            
+            # 发送HTTP请求
+            response = requests.get(api_url, params=params, timeout=10)
+            response.raise_for_status()
+            
+            # 解析返回的JSON数据
+            data = response.json()
+            
+            if data.get("status") == 1 and "data" in data:
+                oil_data = data["data"]
+                
+                # 构建油价信息文本
+                oil_info = f"📊 {oil_data['name']}油价信息\n"
+                oil_info += f"📅 更新时间：{oil_data['date']}\n"
+                oil_info += f"⛽ 92号汽油：{oil_data['p92']}元/升\n"
+                oil_info += f"⛽ 95号汽油：{oil_data['p95']}元/升\n"
+                oil_info += f"⛽ 98号汽油：{oil_data['p98']}元/升\n"
+                oil_info += f"⛽ 0号柴油：{oil_data['p0']}元/升\n"
+                
+                # 添加其他油品信息（如果存在且不为"-"）
+                if oil_data.get('p10') and oil_data['p10'] != "-":
+                    oil_info += f"⛽ 10号柴油：{oil_data['p10']}元/升\n"
+                if oil_data.get('p20') and oil_data['p20'] != "-":
+                    oil_info += f"⛽ 20号柴油：{oil_data['p20']}元/升\n"
+                if oil_data.get('p35') and oil_data['p35'] != "-":
+                    oil_info += f"⛽ 35号柴油：{oil_data['p35']}元/升\n"
+                
+                oil_info += f"🔄 下次更新时间：{oil_data['next_update_time']}"
+                
+                yield event.plain_result(oil_info)
+            else:
+                yield event.plain_result(f"查询失败：{data.get('message', '未知错误')}")
+                
+        except requests.exceptions.RequestException as e:
+            logger.error(f"油价查询请求失败: {e}")
+            yield event.plain_result("油价查询失败，请稍后重试")
+        except json.JSONDecodeError as e:
+            logger.error(f"油价数据解析失败: {e}")
+            yield event.plain_result("油价数据解析失败，请稍后重试")
+        except Exception as e:
+            logger.error(f"油价查询异常: {e}")
+            yield event.plain_result("油价查询出现异常，请稍后重试")
 
     async def terminate(self):
         """可选择实现异步的插件销毁方法，当插件被卸载/停用时会调用。"""
