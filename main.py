@@ -120,7 +120,23 @@ class DNF_Plugin(Star):
         """查询油价信息"""
         try:
             # 获取消息内容，提取地区信息
-            message = event.get_message_content()
+            # 获取消息内容，提取地区信息
+            # 根据日志显示，AiocqhttpMessageEvent对象有message_str属性
+            message = ""
+            if hasattr(event, 'message_str'):
+                message = event.message_str
+                logger.info(f"通过event.message_str获取到消息: {message}")
+            elif hasattr(event, 'get_message_str'):
+                message = event.get_message_str()
+                logger.info(f"通过event.get_message_str()获取到消息: {message}")
+            elif hasattr(event, 'message_obj'):
+                message = str(event.message_obj)
+                logger.info(f"通过event.message_obj获取到消息: {message}")
+            else:
+                # 如果都找不到，尝试从事件的其他属性获取
+                message = str(event)
+                logger.info(f"通过str(event)获取到消息: {message}")
+            
             # 提取地区名称，格式：油价 河南
             area_match = re.search(r'油价\s+(.+)', message)
             if not area_match:
