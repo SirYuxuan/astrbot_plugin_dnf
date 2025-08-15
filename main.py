@@ -136,24 +136,30 @@ class DNF_Plugin(Star):
             
             # 智能解析消息内容
             # 格式1: 油价 河南 (查询地区油价)
-            # 格式2: 油价 92 8.5 7.5 (计算行驶成本: 油号 油价 百公里油耗)
-            # 格式3: 油价 95 8.2 8.0 100 (计算行驶成本: 油号 油价 百公里油耗 行驶里程)
+            # 格式2: 油价 河南 92 7.5 (计算行驶成本: 地区 油号 百公里油耗)
+            # 格式3: 油价 河南 95 8.0 100 (计算行驶成本: 地区 油号 百公里油耗 行驶里程)
             
             # 尝试匹配计算格式
-            calc_match = re.search(r'油价\s+(\d+)\s+([\d.]+)\s+([\d.]+)(?:\s+(\d+))?', message)
+            calc_match = re.search(r'油价\s+([^\s]+)\s+(\d+)\s+([\d.]+)(?:\s+(\d+))?', message)
             if calc_match:
                 # 油价计算模式
-                oil_type = calc_match.group(1)  # 油号
-                oil_price = float(calc_match.group(2))  # 油价
+                area = calc_match.group(1)  # 地区
+                oil_type = calc_match.group(2)  # 油号
                 consumption = float(calc_match.group(3))  # 百公里油耗
                 distance = int(calc_match.group(4)) if calc_match.group(4) else 100  # 行驶里程，默认100公里
                 
-                result = self.calculate_oil_cost(oil_type, oil_price, consumption, distance)
+                # 先获取该地区的油价信息
+                oil_price = await self.get_oil_price_by_type(area, oil_type)
+                if oil_price is None:
+                    yield event.plain_result(f"❌ 无法获取{area}地区{oil_type}号油的价格信息")
+                    return
+                
+                result = self.calculate_oil_cost(oil_type, oil_price, consumption, distance, area)
                 yield event.plain_result(result)
                 return
             
-            # 尝试匹配地区查询格式
-            area_match = re.search(r'油价\s+(.+)', message)
+            # 尝试匹配地区查询格式（只匹配纯地区名，不包含数字）
+            area_match = re.search(r'油价\s+([^\s\d]+)$', message)
             if area_match:
                 # 地区油价查询模式
                 area = area_match.group(1).strip()
@@ -191,8 +197,8 @@ class DNF_Plugin(Star):
                     oil_info += f"🔄 下次更新时间：{oil_data['next_update_time']}\n\n"
                     oil_info += "💡 使用提示：\n"
                     oil_info += "• 油价 河南 - 查询地区油价\n"
-                    oil_info += "• 油价 92 8.5 7.5 - 计算92号汽油8.5元/升，百公里油耗7.5升的行驶成本\n"
-                    oil_info += "• 油价 95 8.2 8.0 100 - 计算95号汽油8.2元/升，百公里油耗8.0升，行驶100公里的成本"
+                    oil_info += "• 油价 河南 92 7.5 - 计算河南地区92号汽油，百公里油耗7.5升的行驶成本\n"
+                    oil_info += "• 油价 河南 95 8.0 100 - 计算河南地区95号汽油，百公里油耗8.0升，行驶100公里的成本"
                     
                     yield event.plain_result(oil_info)
                 else:
@@ -206,11 +212,11 @@ class DNF_Plugin(Star):
                 help_text += "   油价 山东\n"
                 help_text += "   油价 北京\n\n"
                 help_text += "2️⃣ 计算行驶成本：\n"
-                help_text += "   油价 92 8.5 7.5\n"
-                help_text += "   (92号汽油，8.5元/升，百公里油耗7.5升)\n\n"
+                help_text += "   油价 河南 92 7.5\n"
+                help_text += "   (河南地区92号汽油，自动获取油价，百公里油耗7.5升)\n\n"
                 help_text += "3️⃣ 计算指定里程成本：\n"
-                help_text += "   油价 95 8.2 8.0 100\n"
-                help_text += "   (95号汽油，8.2元/升，百公里油耗8.0升，行驶100公里)\n\n"
+                help_text += "   油价 河南 95 8.0 100\n"
+                help_text += "   (河南地区95号汽油，自动获取油价，百公里油耗8.0升，行驶100公里)\n\n"
                 help_text += "💡 油耗参考：\n"
                 help_text += "• 小型车：5-8升/百公里\n"
                 help_text += "• 中型车：7-10升/百公里\n"
@@ -229,7 +235,39 @@ class DNF_Plugin(Star):
             logger.error(f"油价查询异常: {e}")
             yield event.plain_result("油价查询出现异常，请稍后重试")
 
-    def calculate_oil_cost(self, oil_type, oil_price, consumption, distance):
+    async def get_oil_price_by_type(self, area, oil_type):
+        """根据地区和油号获取油价"""
+        try:
+            # 构建API请求URL
+            api_url = "https://www.iamwawa.cn/oilprice/api"
+            params = {"area": area}
+            
+            # 发送HTTP请求
+            response = requests.get(api_url, params=params, timeout=10)
+            response.raise_for_status()
+            
+            # 解析返回的JSON数据
+            data = response.json()
+            
+            if data.get("status") == 1 and "data" in data:
+                oil_data = data["data"]
+                
+                # 根据油号获取对应价格
+                price_key = f"p{oil_type}"
+                if price_key in oil_data and oil_data[price_key] != "-":
+                    return float(oil_data[price_key])
+                else:
+                    logger.warning(f"地区{area}的{oil_type}号油价格不存在或为-")
+                    return None
+            else:
+                logger.error(f"获取{area}地区油价失败：{data.get('message', '未知错误')}")
+                return None
+                
+        except Exception as e:
+            logger.error(f"获取{area}地区{oil_type}号油价异常: {e}")
+            return None
+
+    def calculate_oil_cost(self, oil_type, oil_price, consumption, distance, area=""):
         """计算油价成本"""
         try:
             # 计算每公里油耗
@@ -246,6 +284,8 @@ class DNF_Plugin(Star):
             
             # 构建结果文本
             result = f"🛢️ 油价成本计算器\n\n"
+            if area:
+                result += f"📍 地区：{area}\n"
             result += f"📊 计算参数：\n"
             result += f"• 油品类型：{oil_type}号\n"
             result += f"• 油价：{oil_price}元/升\n"
