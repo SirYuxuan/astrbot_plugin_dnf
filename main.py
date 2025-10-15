@@ -6,6 +6,7 @@ import asyncio
 import re
 import os
 import json
+import datetime
 import requests
 from astrbot.api.event import MessageChain
 
@@ -20,6 +21,17 @@ class DNF_Plugin(Star):
         self.sent_ratio_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'last_sent_avg_ratio.json')
         self.load_last_sent_avg_ratio()
         asyncio.get_event_loop().create_task(self.scheduled_task())
+        # 每日早上8点检查油价变动并发送通知（启动时会先发送一次）
+        asyncio.get_event_loop().create_task(self.oil_price_daily_task())
+
+        # 持久化文件，用于保存上次获取的油价数据，避免重启失效
+        self.oil_data_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'last_oil_data.json')
+        self.last_oil_data = {}
+        self.load_last_oil_data()
+        # 可配置的监控地区列表，当前仅监控河南
+        self.MONITOR_AREAS = ["河南"]
+        # 推送目标群组（默认与金币通知相同）
+        self.oil_notify_group_id = 101344113
 
     def load_last_avg_ratio(self):
         if os.path.exists(self.ratio_file):
@@ -60,6 +72,136 @@ class DNF_Plugin(Star):
         if match:
             return float(match.group(1))
         return None
+
+    def load_last_oil_data(self):
+        if os.path.exists(self.oil_data_file):
+            try:
+                with open(self.oil_data_file, 'r') as f:
+                    data = json.load(f)
+                    if isinstance(data, dict):
+                        self.last_oil_data = data
+            except Exception as e:
+                logger.error(f"读取上次油价数据失败: {e}")
+
+    def save_last_oil_data(self):
+        try:
+            with open(self.oil_data_file, 'w') as f:
+                json.dump(self.last_oil_data, f, ensure_ascii=False)
+        except Exception as e:
+            logger.error(f"保存上次油价数据失败: {e}")
+
+    def format_oil_info(self, oil_data):
+        # 接受 API 返回的单个地区的 data 字典，格式化为文本
+        try:
+            s = f"📊 {oil_data.get('name','未知地区')} 油价信息\n"
+            s += f"📅 更新时间：{oil_data.get('date','未知')}\n"
+            s += f"⛽ 92号汽油：{oil_data.get('p92','-')}元/升\n"
+            s += f"⛽ 95号汽油：{oil_data.get('p95','-')}元/升\n"
+            s += f"⛽ 98号汽油：{oil_data.get('p98','-')}元/升\n"
+            s += f"⛽ 0号柴油：{oil_data.get('p0','-')}元/升\n"
+            if oil_data.get('p10') and oil_data['p10'] != "-":
+                s += f"⛽ 10号柴油：{oil_data['p10']}元/升\n"
+            if oil_data.get('p20') and oil_data['p20'] != "-":
+                s += f"⛽ 20号柴油：{oil_data['p20']}元/升\n"
+            if oil_data.get('p35') and oil_data['p35'] != "-":
+                s += f"⛽ 35号柴油：{oil_data['p35']}元/升\n"
+            return s
+        except Exception as e:
+            logger.error(f"格式化油价信息失败: {e}")
+            return ""
+
+    async def fetch_oil_data_for_area(self, area):
+        # 返回 API 的 data 字典或 None
+        try:
+            api_url = "https://www.iamwawa.cn/oilprice/api"
+            params = {"area": area}
+            response = requests.get(api_url, params=params, timeout=10)
+            response.raise_for_status()
+            data = response.json()
+            if data.get("status") == 1 and "data" in data:
+                return data["data"]
+            else:
+                logger.warning(f"获取{area}地区油价失败：{data.get('message','未知错误')}")
+                return None
+        except Exception as e:
+            logger.error(f"获取{area}地区油价异常: {e}")
+            return None
+
+    async def oil_price_daily_task(self):
+        """每天早上8点查询监控地区油价，启动时会立即发送一次，若与上次数据有变动则发送通知并保存最新数据"""
+        # 等待框架就绪（短暂等待），再执行首次发送
+        await asyncio.sleep(2)
+        try:
+            # 尝试获取 aiocqhttp 客户端
+            platform = None
+            for p in self.context.platform_manager.get_insts():
+                if p.meta().name == "aiocqhttp":
+                    platform = p
+                    break
+            client = platform.get_client() if platform else None
+
+            # 启动时发送一次全部监控地区油价（不做变动比较）
+            all_infos = []
+            for area in self.MONITOR_AREAS:
+                oil = await self.fetch_oil_data_for_area(area)
+                if oil:
+                    all_infos.append(self.format_oil_info(oil))
+                    # 更新缓存
+                    self.last_oil_data[area] = oil
+            if all_infos and client:
+                msg = "油价更新通知：\n\n" + "\n".join(all_infos)
+                try:
+                    await client.send_group_msg(group_id=self.oil_notify_group_id, message=msg)
+                except Exception as e:
+                    logger.error(f"发送启动时油价通知失败: {e}")
+            # 保存首次获取的数据
+            self.save_last_oil_data()
+
+            # 主循环：每天在 08:00 触发检查
+            while True:
+                now = datetime.datetime.now()
+                # 计算下一个 08:00 的时间点
+                target = now.replace(hour=8, minute=0, second=0, microsecond=0)
+                if now >= target:
+                    target = target + datetime.timedelta(days=1)
+                wait_seconds = (target - now).total_seconds()
+                await asyncio.sleep(wait_seconds)
+
+                # 到达 08:00，检查每个监控地区是否有变化
+                changed = False
+                changed_infos = []
+                for area in self.MONITOR_AREAS:
+                    oil = await self.fetch_oil_data_for_area(area)
+                    if not oil:
+                        continue
+                    prev = self.last_oil_data.get(area)
+                    # 比较关键字段
+                    keys = ['p92','p95','p98','p0','p10','p20','p35']
+                    diff_found = False
+                    if prev is None:
+                        diff_found = True
+                    else:
+                        for k in keys:
+                            if str(prev.get(k)) != str(oil.get(k)):
+                                diff_found = True
+                                break
+                    if diff_found:
+                        changed = True
+                        changed_infos.append(self.format_oil_info(oil))
+                        # 更新缓存
+                        self.last_oil_data[area] = oil
+
+                if changed and client and changed_infos:
+                    msg = "油价更新通知：\n\n" + "\n".join(changed_infos)
+                    try:
+                        await client.send_group_msg(group_id=self.oil_notify_group_id, message=msg)
+                    except Exception as e:
+                        logger.error(f"发送油价更新通知失败: {e}")
+                    # 保存变动后的数据
+                    self.save_last_oil_data()
+
+        except Exception as e:
+            logger.error(f"油价每日任务异常: {e}")
 
     async def initialize(self):
         """可选择实现异步的插件初始化方法，当实例化该插件类之后会自动调用该方法。"""
@@ -114,6 +256,8 @@ class DNF_Plugin(Star):
         user_name = event.get_sender_name()
         ratio_text = DnfGoldRatioFetcher.fetch_gold_ratio_text()
         yield event.plain_result(ratio_text)
+
+    # 已移除独立的 DNF 帮助指令（不再注册 'dnf帮助'）
 
     @filter.command("油价")
     async def oil_price(self, event):
@@ -195,35 +339,20 @@ class DNF_Plugin(Star):
                         oil_info += f"⛽ 35号柴油：{oil_data['p35']}元/升\n"
                     
                     oil_info += f"🔄 下次更新时间：{oil_data['next_update_time']}\n\n"
-                    oil_info += "💡 使用提示：\n"
-                    oil_info += "• 油价 河南 - 查询地区油价\n"
-                    oil_info += "• 油价 河南 92 7.5 - 计算河南地区92号汽油，百公里油耗7.5升的行驶成本\n"
-                    oil_info += "• 油价 河南 95 8.0 100 - 计算河南地区95号汽油，百公里油耗8.0升，行驶100公里的成本"
+                    # 不在查询结果中附带使用示例，使用单独指令 '油价帮助' 查看详细说明
                     
                     yield event.plain_result(oil_info)
                 else:
                     yield event.plain_result(f"查询失败：{data.get('message', '未知错误')}")
             else:
-                # 显示使用说明
-                help_text = "🚗 油价查询与计算器\n\n"
-                help_text += "📋 使用方法：\n\n"
-                help_text += "1️⃣ 查询地区油价：\n"
-                help_text += "   油价 河南\n"
-                help_text += "   油价 山东\n"
-                help_text += "   油价 北京\n\n"
-                help_text += "2️⃣ 计算行驶成本：\n"
-                help_text += "   油价 河南 92 7.5\n"
-                help_text += "   (河南地区92号汽油，自动获取油价，百公里油耗7.5升)\n\n"
-                help_text += "3️⃣ 计算指定里程成本：\n"
-                help_text += "   油价 河南 95 8.0 100\n"
-                help_text += "   (河南地区95号汽油，自动获取油价，百公里油耗8.0升，行驶100公里)\n\n"
-                help_text += "💡 油耗参考：\n"
-                help_text += "• 小型车：5-8升/百公里\n"
-                help_text += "• 中型车：7-10升/百公里\n"
-                help_text += "• 大型车：10-15升/百公里\n"
-                help_text += "• SUV：8-12升/百公里"
+                # 参数不正确，提示正确的使用方法
+                error_text = "❌ 参数格式不正确\n\n"
+                error_text += "📋 正确格式：\n"
+                error_text += "• 油价 地区名 - 查询地区油价\n"
+                error_text += "• 油价 地区名 油号 油耗 - 计算行驶成本\n"
+                error_text += "• 油价 地区名 油号 油耗 里程 - 计算指定里程成本\n"
                 
-                yield event.plain_result(help_text)
+                yield event.plain_result(error_text)
                 
         except requests.exceptions.RequestException as e:
             logger.error(f"油价查询请求失败: {e}")
@@ -234,6 +363,8 @@ class DNF_Plugin(Star):
         except Exception as e:
             logger.error(f"油价查询异常: {e}")
             yield event.plain_result("油价查询出现异常，请稍后重试")
+
+    # 已移除 '油价帮助' 指令，应答中不再引用独立帮助命令
 
     async def get_oil_price_by_type(self, area, oil_type):
         """根据地区和油号获取油价"""
