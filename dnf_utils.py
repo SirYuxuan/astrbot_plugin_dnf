@@ -65,21 +65,28 @@ class DnfGoldRatioFetcher:
                 else:
                     title_text = f"{amount_str}{unit}".strip()
 
-                # singleprice 是 元 / 单位（示例中为 元/万金币）
-                singleprice_raw = it.get("singleprice")
+                # price 是总价（元），singleprice 是 元/单位，两者等价可用来计算比率
+                price_raw = it.get("price")
                 try:
-                    singleprice = float(singleprice_raw)
+                    price = float(price_raw)
                 except Exception:
-                    singleprice = None
+                    price = None
 
                 ratio_val = None
-                if singleprice and singleprice > 0:
-                    # 1 元 = (1 / singleprice) 单位（例如 万金币）
-                    ratio_val = 1.0 / singleprice
-                    ratios.append(ratio_val)
+                if price and price > 0:
+                    # ratio = amount(单位：万金币) / price(元) -> 万金币/元
+                    try:
+                        ratio_val = af / price
+                    except Exception:
+                        ratio_val = None
+                    if ratio_val:
+                        ratios.append(ratio_val)
 
+                price_text = f"{price:.2f}" if price is not None else "-"
                 ratio_text = f"1元={ratio_val:.4f}万金币" if ratio_val else "1元= - 万金币"
-                results.append(f"{idx:<2} {title_text:<18} {ratio_text:<16}")
+                # 每行显示：<idx> <amount+unit>=<price>元    <ratio>
+                # 取消 amount 与 '=' 之间的填充空格，使输出为 10000万金币=141.84元
+                results.append(f"{idx:<2} {amount_str}{unit}={price_text}元    {ratio_text}")
 
             avg_ratio = sum(ratios) / len(ratios) if ratios else 0
             results.append("-" * 38)
@@ -88,3 +95,4 @@ class DnfGoldRatioFetcher:
             return "\n".join(results)
         except Exception as e:
             return f"查询金币比例失败：{e}"
+
