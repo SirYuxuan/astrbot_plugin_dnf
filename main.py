@@ -8,6 +8,7 @@ import os
 import json
 import datetime
 import requests
+import time
 from astrbot.api.event import MessageChain
 
 @register("yuxuandnf", "Sir 丶雨轩", "雨轩DNF 查询插件，支持金币比例查询和油价查询与计算器。", "v1.2")
@@ -23,15 +24,23 @@ class DNF_Plugin(Star):
         asyncio.get_event_loop().create_task(self.scheduled_task())
         # 每日早上8点检查油价变动并发送通知（启动时会先发送一次）
         asyncio.get_event_loop().create_task(self.oil_price_daily_task())
+        # 每隔1小时检查平舆蛋价，且每天仅发送一次（发送给指定QQ好友）
+        asyncio.get_event_loop().create_task(self.egg_price_hourly_task())
 
         # 持久化文件，用于保存上次获取的油价数据，避免重启失效
         self.oil_data_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'last_oil_data.json')
         self.last_oil_data = {}
         self.load_last_oil_data()
+        # 蛋价推送持久化（记录最后发送日期，格式 YYYY-MM-DD）
+        self.egg_sent_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'last_egg_sent_date.json')
+        self.last_egg_sent_date = None
+        self.load_last_egg_sent_date()
         # 可配置的监控地区列表，当前仅监控河南
         self.MONITOR_AREAS = ["河南"]
         # 推送目标群组（默认与金币通知相同）
         self.oil_notify_group_id = 101344113
+        # 蛋价推送目标群ID（改为群推送）
+        self.egg_notify_group_id = 527189909
 
     def load_last_avg_ratio(self):
         if os.path.exists(self.ratio_file):
@@ -89,6 +98,24 @@ class DNF_Plugin(Star):
                 json.dump(self.last_oil_data, f, ensure_ascii=False)
         except Exception as e:
             logger.error(f"保存上次油价数据失败: {e}")
+
+    def load_last_egg_sent_date(self):
+        if os.path.exists(self.egg_sent_file):
+            try:
+                with open(self.egg_sent_file, 'r') as f:
+                    data = json.load(f)
+                    val = data.get('last_egg_sent_date')
+                    if val:
+                        self.last_egg_sent_date = str(val)
+            except Exception as e:
+                logger.error(f"读取上次蛋价发送日期失败: {e}")
+
+    def save_last_egg_sent_date(self):
+        try:
+            with open(self.egg_sent_file, 'w') as f:
+                json.dump({'last_egg_sent_date': self.last_egg_sent_date}, f, ensure_ascii=False)
+        except Exception as e:
+            logger.error(f"保存上次蛋价发送日期失败: {e}")
 
     def format_oil_info(self, oil_data):
         # 接受 API 返回的单个地区的 data 字典，格式化为文本
@@ -202,6 +229,212 @@ class DNF_Plugin(Star):
 
         except Exception as e:
             logger.error(f"油价每日任务异常: {e}")
+
+    def fetch_egg_prices(self, area_name: str, date_str: str):
+        """同步查询指定地区和日期的蛋价列表，返回和之前 handler 相同格式的 items 列表。"""
+        base = "http://www.quotn.cn/e/search"
+        params = {
+            "k": area_name or "",
+            "areaName": area_name or "",
+            "pDate": date_str,
+            "_": str(int(time.time() * 1000)),
+        }
+        try:
+            resp = requests.get(base, params=params, timeout=10)
+            resp.raise_for_status()
+        except Exception as e:
+            logger.error(f"fetch_egg_prices 请求失败: {e}")
+            return []
+
+        results = []
+        try:
+            j = resp.json()
+        except Exception:
+            j = None
+
+        def collect(obj):
+            if isinstance(obj, dict):
+                for k in ("price", "priceText", "金额"):
+                    if k in obj:
+                        title = obj.get("title") or obj.get("name") or obj.get("标题") or ""
+                        raw = obj.get(k)
+                        try:
+                            price = float(str(raw))
+                        except Exception:
+                            m = re.search(r"([0-9]+(?:\.[0-9]+)?)", str(raw or ""))
+                            price = float(m.group(1)) if m else None
+                        utime_raw = None
+                        for tkey in ("uTime", "utime", "u_time", "time", "date", "pubTime", "pubtime", "报价时间"):
+                            if tkey in obj and obj.get(tkey):
+                                utime_raw = obj.get(tkey)
+                                break
+                        utime_fmt = None
+                        if utime_raw is not None:
+                            try:
+                                if isinstance(utime_raw, (int, float)) or (isinstance(utime_raw, str) and utime_raw.isdigit()):
+                                    n = int(utime_raw)
+                                    if n > 10**12:
+                                        n = n // 1000
+                                    utime_fmt = datetime.datetime.fromtimestamp(n).strftime('%Y-%m-%d %H:%M')
+                                else:
+                                    utime_fmt = str(utime_raw)[:19]
+                            except Exception:
+                                utime_fmt = str(utime_raw)
+                        results.append({"title": title.strip(), "price": price, "utime": utime_fmt})
+                        return True
+                for v in obj.values():
+                    collect(v)
+            elif isinstance(obj, list):
+                for it in obj:
+                    collect(it)
+
+        parsed_from_list = False
+        if isinstance(j, dict):
+            body = j.get('body') if isinstance(j.get('body'), dict) else None
+            data_list = None
+            if body and isinstance(body.get('dataList'), list):
+                data_list = body.get('dataList')
+            elif isinstance(j.get('dataList'), list):
+                data_list = j.get('dataList')
+
+            if isinstance(data_list, list) and data_list:
+                for item in data_list:
+                    if not isinstance(item, dict):
+                        continue
+                    cName = item.get('cName') or ''
+                    aName = item.get('aName') or ''
+                    title = f"{cName}{aName}" if (cName or aName) else (item.get('aName') or item.get('name') or '')
+                    price = None
+                    if 'tPrice' in item and item.get('tPrice') not in (None, ''):
+                        try:
+                            price = float(str(item.get('tPrice')))
+                        except Exception:
+                            m = re.search(r"([0-9]+(?:\.[0-9]+)?)", str(item.get('tPrice') or ""))
+                            price = float(m.group(1)) if m else None
+                    else:
+                        for pk in ("price", "priceText", "金额", "yPrice"):
+                            if pk in item and item.get(pk) not in (None, ""):
+                                try:
+                                    price = float(str(item.get(pk)))
+                                except Exception:
+                                    m = re.search(r"([0-9]+(?:\.[0-9]+)?)", str(item.get(pk) or ""))
+                                    price = float(m.group(1)) if m else None
+                                break
+                    up_time = item.get('upTime') or None
+                    yprice = None
+                    if 'yPrice' in item and item.get('yPrice') not in (None, ''):
+                        try:
+                            yprice = float(str(item.get('yPrice')))
+                        except Exception:
+                            m = re.search(r"([0-9]+(?:\.[0-9]+)?)", str(item.get('yPrice') or ""))
+                            yprice = float(m.group(1)) if m else None
+                    results.append({"title": title.strip(), "price": price, "upTime": up_time, "cName": cName, "aName": aName, "yPrice": yprice})
+                parsed_from_list = True
+        if not parsed_from_list:
+            collect(j)
+
+        if not results:
+            text = resp.text
+            pattern = re.compile(r"([\u4e00-\u9fff\w\-\s\/（）()]{2,60}?)\s*[：:\-\s]{0,3}\s*([0-9]+(?:\.[0-9]+)?)\s*(?:元|元/斤|元/公斤)")
+            found = pattern.findall(text)
+            for title, price_s in found:
+                try:
+                    price = float(price_s)
+                except Exception:
+                    price = None
+                results.append({"title": title.strip(), "price": price})
+
+        return results
+
+    async def egg_price_hourly_task(self):
+        """每隔1小时检查平舆蛋价，且每天仅发送一次到指定好友。"""
+        await asyncio.sleep(2)
+        try:
+            while True:
+                try:
+                    today = datetime.date.today().strftime('%Y-%m-%d')
+                    # 若今日已发送则跳过
+                    if self.last_egg_sent_date == today:
+                        await asyncio.sleep(3600)
+                        continue
+
+                    # 查询今日蛋价
+                    area = '平舆'
+                    date_str = datetime.date.today().strftime('%Y%m%d')
+                    items = self.fetch_egg_prices(area, date_str)
+                    if not items:
+                        await asyncio.sleep(3600)
+                        continue
+
+                    # 构建推送内容，最多10条
+                    lines = []
+                    lines.append(f"返回查询结果（{today}前10条）：")
+                    cnt = 0
+                    seen = set()
+                    for it in items:
+                        c = it.get('cName') or ''
+                        a = it.get('aName') or ''
+                        if c and a:
+                            title = f"{c}-{a}" if c != a else c
+                        elif c or a:
+                            title = c or a
+                        else:
+                            title = it.get('title') or '-'
+                        price = it.get('price')
+                        up_time = it.get('upTime')
+                        y_price = it.get('yPrice')
+                        # 计算简短涨跌
+                        change_mark_short = '平'
+                        try:
+                            if isinstance(price, (int, float)) and isinstance(y_price, (int, float)) and y_price != 0:
+                                diff_pct = (price - y_price) / y_price * 100
+                                pct = round(abs(diff_pct))
+                                if diff_pct > 0:
+                                    change_mark_short = f"涨{pct}%"
+                                elif diff_pct < 0:
+                                    change_mark_short = f"跌{pct}%"
+                                else:
+                                    change_mark_short = '平'
+                        except Exception:
+                            change_mark_short = '平'
+
+                        key = (title, float(price) if isinstance(price, (int, float)) else price, up_time)
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                        cnt += 1
+                        if cnt > 10:
+                            break
+                        price_text = f"{price:.2f}元" if isinstance(price, (int, float)) else (str(price) if price is not None else "-")
+                        if up_time:
+                            lines.append(f"{cnt} .{title} {up_time} {price_text}({change_mark_short})")
+                        else:
+                            lines.append(f"{cnt} .{title} {price_text}({change_mark_short})")
+
+                    msg = "\n".join(lines)
+
+                    # 获取 aiocqhttp 客户端并发送私信
+                    platform = None
+                    for p in self.context.platform_manager.get_insts():
+                        if p.meta().name == "aiocqhttp":
+                            platform = p
+                            break
+                    client = platform.get_client() if platform else None
+                    if client:
+                        try:
+                            await client.send_group_msg(group_id=self.egg_notify_group_id, message=msg)
+                            self.last_egg_sent_date = today
+                            self.save_last_egg_sent_date()
+                        except Exception as e:
+                            logger.error(f"发送蛋价群消息失败: {e}")
+
+                except Exception as e:
+                    logger.error(f"egg_price_hourly_task 内部异常: {e}")
+
+                # 每隔1小时检查一次
+                await asyncio.sleep(3600)
+        except Exception as e:
+            logger.error(f"蛋价每小时任务异常: {e}")
 
     async def initialize(self):
         """可选择实现异步的插件初始化方法，当实例化该插件类之后会自动调用该方法。"""
@@ -363,6 +596,270 @@ class DNF_Plugin(Star):
         except Exception as e:
             logger.error(f"油价查询异常: {e}")
             yield event.plain_result("油价查询出现异常，请稍后重试")
+
+    @filter.command("蛋价")
+    async def egg_price(self, event):
+        """查询蛋价，示例：
+        • 蛋价 河南        -> 查询河南地区（默认关键词：鸡蛋）
+        • 蛋价 河南 20260129 -> 指定日期查询
+        """
+        try:
+            # 获取消息内容（与油价处理方式一致）
+            message = ""
+            if hasattr(event, 'message_str'):
+                message = event.message_str
+            elif hasattr(event, 'get_message_str'):
+                message = event.get_message_str()
+            elif hasattr(event, 'message_obj'):
+                message = str(event.message_obj)
+            else:
+                message = str(event)
+
+            # 解析参数：蛋价 [地区] [可选日期 YYYYMMDD]
+            # 支持：
+            #  - 蛋价 驻马店
+            #  - 蛋价 驻马店 20260129
+            #  - 蛋价 20260129
+            args = ""
+            if '蛋价' in message:
+                args = message.split('蛋价', 1)[1].strip()
+            else:
+                args = message.strip()
+
+            if not args:
+                area = ""
+                pDate = None
+            else:
+                parts = args.split()
+                # 若最后一项是 8 位数字视作日期
+                if parts and parts[-1].isdigit() and len(parts[-1]) == 8:
+                    pDate = parts[-1]
+                    area = " ".join(parts[:-1]).strip()
+                else:
+                    pDate = None
+                    area = " ".join(parts).strip()
+
+            # 清理地区：优先提取首个中文连续块，去掉后缀
+            if area:
+                m_cn = re.search(r"[\u4e00-\u9fff]+", area)
+                area = m_cn.group(0) if m_cn else area
+
+            base = "http://www.quotn.cn/e/search"
+            # 查询并比较今日/昨日价格
+            def query_egg_prices(area_name: str, date_str: str):
+                """返回列表，每项 {'title':..., 'price': float or None}。"""
+                params = {
+                    "k": area_name or "",
+                    "areaName": area_name or "",
+                    "pDate": date_str,
+                    "_": str(int(time.time() * 1000)),
+                }
+                resp = requests.get(base, params=params, timeout=10)
+                resp.raise_for_status()
+                results = []
+                try:
+                    j = resp.json()
+                except Exception:
+                    j = None
+
+                def collect(obj):
+                    if isinstance(obj, dict):
+                        for k in ("price", "priceText", "金额"):
+                            if k in obj:
+                                title = obj.get("title") or obj.get("name") or obj.get("标题") or ""
+                                raw = obj.get(k)
+                                try:
+                                    price = float(str(raw))
+                                except Exception:
+                                    m = re.search(r"([0-9]+(?:\.[0-9]+)?)", str(raw or ""))
+                                    price = float(m.group(1)) if m else None
+                                # 尝试提取时间字段（可能的字段名）
+                                utime_raw = None
+                                for tkey in ("uTime", "utime", "u_time", "time", "date", "pubTime", "pubtime", "报价时间"):
+                                    if tkey in obj and obj.get(tkey):
+                                        utime_raw = obj.get(tkey)
+                                        break
+                                utime_fmt = None
+                                if utime_raw is not None:
+                                    try:
+                                        # 若为纯数字字符串或数字，尝试解析为时间戳（秒或毫秒）
+                                        if isinstance(utime_raw, (int, float)) or (isinstance(utime_raw, str) and utime_raw.isdigit()):
+                                            n = int(utime_raw)
+                                            # 若为毫秒级时间戳（> 1e12），则转换为秒
+                                            if n > 10**12:
+                                                n = n // 1000
+                                            utime_fmt = datetime.datetime.fromtimestamp(n).strftime('%Y-%m-%d %H:%M')
+                                        else:
+                                            # 否则直接使用字符串形式（裁剪过长）
+                                            utime_fmt = str(utime_raw)[:19]
+                                    except Exception:
+                                        utime_fmt = str(utime_raw)
+                                results.append({"title": title.strip(), "price": price, "utime": utime_fmt})
+                                return True
+                        for v in obj.values():
+                            collect(v)
+                    elif isinstance(obj, list):
+                        for it in obj:
+                            collect(it)
+
+                # 优先解析常见的 'body.dataList' 或顶级 'dataList' 列表结构
+                parsed_from_list = False
+                if isinstance(j, dict):
+                    body = j.get('body') if isinstance(j.get('body'), dict) else None
+                    data_list = None
+                    if body and isinstance(body.get('dataList'), list):
+                        data_list = body.get('dataList')
+                    elif isinstance(j.get('dataList'), list):
+                        data_list = j.get('dataList')
+
+                    if isinstance(data_list, list) and data_list:
+                        for item in data_list:
+                            if not isinstance(item, dict):
+                                continue
+                            # 地址使用 cName + aName
+                            cName = item.get('cName') or ''
+                            aName = item.get('aName') or ''
+                            title = f"{cName}{aName}" if (cName or aName) else (item.get('aName') or item.get('name') or '')
+                            # 尝试获取价格字段（使用 tPrice）
+                            price = None
+                            if 'tPrice' in item and item.get('tPrice') not in (None, ''):
+                                try:
+                                    price = float(str(item.get('tPrice')))
+                                except Exception:
+                                    m = re.search(r"([0-9]+(?:\.[0-9]+)?)", str(item.get('tPrice') or ""))
+                                    price = float(m.group(1)) if m else None
+                            else:
+                                for pk in ("price", "priceText", "金额", "yPrice"):
+                                    if pk in item and item.get(pk) not in (None, ""):
+                                        try:
+                                            price = float(str(item.get(pk)))
+                                        except Exception:
+                                            m = re.search(r"([0-9]+(?:\.[0-9]+)?)", str(item.get(pk) or ""))
+                                            price = float(m.group(1)) if m else None
+                                        break
+                            # upTime 字段直接使用（不加标签）
+                            up_time = item.get('upTime') or None
+                            # yPrice 可作为昨日价格参考
+                            yprice = None
+                            if 'yPrice' in item and item.get('yPrice') not in (None, ''):
+                                try:
+                                    yprice = float(str(item.get('yPrice')))
+                                except Exception:
+                                    m = re.search(r"([0-9]+(?:\.[0-9]+)?)", str(item.get('yPrice') or ""))
+                                    yprice = float(m.group(1)) if m else None
+                            results.append({"title": title.strip(), "price": price, "upTime": up_time, "cName": cName, "aName": aName, "yPrice": yprice})
+                        parsed_from_list = True
+                if not parsed_from_list:
+                    collect(j)
+
+                if not results:
+                    text = resp.text
+                    pattern = re.compile(r"([\u4e00-\u9fff\w\-\s\/（）()]{2,60}?)\s*[：:\-\s]{0,3}\s*([0-9]+(?:\.[0-9]+)?)\s*(?:元|元/斤|元/公斤)")
+                    found = pattern.findall(text)
+                    for title, price_s in found:
+                        try:
+                            price = float(price_s)
+                        except Exception:
+                            price = None
+                        results.append({"title": title.strip(), "price": price})
+
+                return results
+
+            # 计算日期字符串
+            today_str = pDate or datetime.date.today().strftime("%Y%m%d")
+            try:
+                dt = datetime.datetime.strptime(today_str, "%Y%m%d").date()
+            except Exception:
+                dt = datetime.date.today()
+            yesterday = dt - datetime.timedelta(days=1)
+            yesterday_str = yesterday.strftime("%Y%m%d")
+
+            today_items = query_egg_prices(area, today_str)
+            yesterday_items = query_egg_prices(area, yesterday_str)
+
+            def average_price(items):
+                vals = [it.get("price") for it in items if isinstance(it.get("price"), (int, float))]
+                if not vals:
+                    return None
+                return sum(vals) / len(vals)
+
+            avg_today = average_price(today_items)
+            avg_yesterday = average_price(yesterday_items)
+
+            lines = []
+            # 不显示均价比较，直接返回查询结果标题（含日期）
+            lines.append(f"返回查询结果（{dt.strftime('%Y-%m-%d')}前10条）：")
+
+            # 列出今日条目（最多10条），并根据昨日价格计算涨跌标记
+            if today_items:
+                lines.append("\n查询结果（今日前10条）：")
+                # 构建昨日价格索引
+                y_map = {}
+                for y in yesterday_items:
+                    key = (y.get('cName') or '', y.get('aName') or '',)
+                    if y.get('price') is not None:
+                        y_map[key] = y.get('price')
+                    elif y.get('yPrice') is not None:
+                        y_map[key] = y.get('yPrice')
+
+                seen = set()
+                cnt = 0
+                for it in today_items:
+                    c = it.get('cName') or ''
+                    a = it.get('aName') or ''
+                    # 地址格式：城市-区县（若相同则只显示一个）
+                    if c and a:
+                        title = f"{c}-{a}" if c != a else c
+                    elif c or a:
+                        title = c or a
+                    else:
+                        title = it.get('title') or '-'
+                    price = it.get('price')
+                    up_time = it.get('upTime')
+                    # 获取昨日价格优先使用今日项中的 yPrice 字段，否则尝试匹配索引
+                    y_price = None
+                    if it.get('yPrice') is not None:
+                        y_price = it.get('yPrice')
+                    else:
+                        key = (c, a)
+                        y_price = y_map.get(key)
+
+                    # 计算涨跌标记（简洁形式，用于括号内显示）
+                    change_mark_short = '平'
+                    try:
+                        if isinstance(price, (int, float)) and isinstance(y_price, (int, float)) and y_price != 0:
+                            diff_pct = (price - y_price) / y_price * 100
+                            pct = round(abs(diff_pct))
+                            if diff_pct > 0:
+                                change_mark_short = f"涨{pct}%"
+                            elif diff_pct < 0:
+                                change_mark_short = f"跌{pct}%"
+                            else:
+                                change_mark_short = '平'
+                    except Exception:
+                        change_mark_short = '平'
+
+                    key = (title, float(price) if isinstance(price, (int, float)) else price, up_time)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    cnt += 1
+                    if cnt > 10:
+                        break
+                    price_text = f"{price:.2f}元" if isinstance(price, (int, float)) else (str(price) if price is not None else "-")
+                    # 输出格式示例：1 .驻马店-平舆 11:37 4.00元(平)
+                    if up_time:
+                        lines.append(f"{cnt} .{title} {up_time} {price_text}({change_mark_short})")
+                    else:
+                        lines.append(f"{cnt} .{title} {price_text}({change_mark_short})")
+            yield event.plain_result("\n".join(lines))
+
+        except requests.exceptions.RequestException as e:
+            logger.error(f"蛋价查询请求失败: {e}")
+            yield event.plain_result("蛋价查询请求失败，请稍后重试")
+        except Exception as e:
+            logger.error(f"蛋价查询异常: {e}")
+            yield event.plain_result("蛋价查询出现异常，请稍后重试")
 
     # 已移除 '油价帮助' 指令，应答中不再引用独立帮助命令
 
