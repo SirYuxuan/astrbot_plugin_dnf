@@ -13,6 +13,8 @@ from astrbot.api.event import MessageChain
 
 @register("yuxuandnf", "Sir 丶雨轩", "雨轩DNF 查询插件，支持金币比例查询和油价查询与计算器。", "v1.2")
 class DNF_Plugin(Star):
+    # 防止同一进程内重复创建定时任务（多次实例化时仍只启动一次）
+    _tasks_started = False
     def __init__(self, context: Context):
         super().__init__(context)
         self.last_avg_ratio = None
@@ -21,11 +23,14 @@ class DNF_Plugin(Star):
         self.last_sent_avg_ratio = None
         self.sent_ratio_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'last_sent_avg_ratio.json')
         self.load_last_sent_avg_ratio()
-        asyncio.get_event_loop().create_task(self.scheduled_task())
-        # 每日早上8点检查油价变动并发送通知（启动时会先发送一次）
-        asyncio.get_event_loop().create_task(self.oil_price_daily_task())
-        # 每隔1小时检查平舆蛋价，且每天仅发送一次（发送给指定QQ好友）
-        asyncio.get_event_loop().create_task(self.egg_price_hourly_task())
+        # 仅在首次实例化时创建后台定时任务，避免重复创建导致重复发送
+        if not DNF_Plugin._tasks_started:
+            DNF_Plugin._tasks_started = True
+            asyncio.get_event_loop().create_task(self.scheduled_task())
+            # 每日早上8点检查油价变动并发送通知（启动时会先发送一次）
+            asyncio.get_event_loop().create_task(self.oil_price_daily_task())
+            # 每隔1小时检查平舆蛋价，且每天仅发送一次（发送给指定QQ好友）
+            asyncio.get_event_loop().create_task(self.egg_price_hourly_task())
 
         # 持久化文件，用于保存上次获取的油价数据，避免重启失效
         self.oil_data_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'last_oil_data.json')
